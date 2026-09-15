@@ -1357,7 +1357,14 @@ if ( $well_known != "" ) {
 
     # 发送CSR
     def send_csr(self, index):
-        csr = self.create_csr(index)
+        try:
+            csr = self.create_csr(index)
+        except Exception as e:
+            # pyOpenSSL>=23 移除 X509Req，回退 cryptography 实现
+            if "X509Req" in str(e) or not hasattr(OpenSSL.crypto, "X509Req"):
+                csr = self.create_csr_new(index)
+            else:
+                raise
         payload = {"csr": self.calculate_safe_base64(csr)}
         send_csr_response = self.acme_request(
             url=self._config['orders'][index]['finalize'], payload=payload)
@@ -1457,6 +1464,14 @@ if ( $well_known != "" ) {
             public.writeFile(path + "/cert.csr", cert['cert'])
             public.writeFile(path + "/root_cert.csr", cert['root'])
 
+            old_hash = None
+            try:
+                path_ex = '{}/data/exclude_hash.json'.format(public.get_panel_path())
+                ex = json.loads(public.readFile(path_ex) or '{}')
+                old_hash = (ex.get("exclude_hash_let") or {}).get(index)
+            except Exception:
+                pass
+
             self.set_exclude_hash(index, cert['cert'] + cert['root'])
 
             # 转为IIS证书
@@ -1481,6 +1496,19 @@ fullchain.pem       粘贴到证书输入框
 '''
             public.writeFile(path+'/说明.txt', ps)
             self.sub_all_cert(key_file, pem_file)
+            # 授权部署：续签/申请成功后自动推送到绑定目标（如七牛）
+            try:
+                from hashlib import md5
+                new_hash = md5((cert['cert'] + cert['root']).encode("utf-8")).hexdigest()
+                domains = self._config.get('orders', {}).get(index, {}).get('domains') or [domain_name]
+                from mod.project.ssl.deployMod import main as deploy_main
+                deploy_main().auto_deploy_on_cert_change(
+                    new_ssl_hash=new_hash,
+                    domains=domains,
+                    old_ssl_hash=old_hash if old_hash and old_hash != new_hash else None,
+                )
+            except Exception as hook_e:
+                write_log("|-授权部署自动推送跳过/失败: {}".format(hook_e))
         except:
             write_log(public.get_error_info())
 
@@ -2849,7 +2877,19 @@ fullchain.pem       粘贴到证书输入框
             from sslModel import certModel
             certModel = certModel.main()
             use_cert_list = certModel.get_cert_to_site(True)
-            hash_list = use_cert_list.keys()
+            hash_list = list(use_cert_list.keys())
+            # 二次开发：纳入授权部署(auto_deploy)绑定的证书（如七牛 CDN 域名，未挂站点）
+            try:
+                from mod.project.ssl.deployMod import main as deploy_main
+                dm = deploy_main()
+                rows = dm.M("deploy_targets").where("auto_deploy=?", (1,)).select() or []
+                for r in rows:
+                    h = (r.get("ssl_hash") or "").strip()
+                    if h and h not in hash_list:
+                        hash_list.append(h)
+                        write_log("|-追加授权部署自动续签证书: {} ({})".format(h, r.get("name")))
+            except Exception as e:
+                write_log("|-读取授权部署自动续签列表失败: {}".format(e))
         s = 0
         from sslModel import base
         dns_data = base.sslBase().get_dns_data(None)

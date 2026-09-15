@@ -1,0 +1,317 @@
+#!/www/server/panel/pyenv/bin/python3
+# -*- coding: utf-8 -*-
+"""七牛云 SSL 授权部署插件（stdin/stdout JSON，对齐 deploy_plugin 协议）"""
+from __future__ import annotations
+
+import base64
+import datetime
+import hashlib
+import hmac
+import json
+import sys
+from typing import Any, Dict, Optional, Tuple
+from urllib.parse import urlparse
+
+import requests
+
+PLUGIN_NAME = "qiniu"
+PLUGIN_VERSION = "1.0.0"
+API_HOST = "http://api.qiniu.com"
+
+
+def ok(message: str = "", result: Optional[dict] = None) -> Dict[str, Any]:
+    return {"status": "success", "message": message or "ok", "result": result or {}}
+
+
+def err(message: str, result: Optional[dict] = None) -> Dict[str, Any]:
+    return {"status": "error", "message": message or "error", "result": result or {}}
+
+
+def _bool(v: Any, default: bool = False) -> bool:
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off", ""):
+        return False
+    return default
+
+
+def qbox_token(access_key: str, secret_key: str, url: str, method: str = "GET", body: bytes = b"") -> str:
+    """QBox 鉴权：对 path[+query] 与 body 签名（与官方 SDK 一致）。"""
+    u = urlparse(url)
+    path = u.path or "/"
+    data = path
+    if u.query:
+        data += "?" + u.query
+    data += "\n"
+    if body and method.upper() in ("POST", "PUT", "PATCH"):
+        # 证书/域名 JSON 接口多为 Content-Type: application/json，签名不含 body；
+        # 与博客脚本 / DomainManager 一致，仅签 path。
+        pass
+    sign = hmac.new(secret_key.encode("utf-8"), data.encode("utf-8"), hashlib.sha1).digest()
+    encoded = base64.urlsafe_b64encode(sign).decode("utf-8")
+    return "{}:{}".format(access_key, encoded)
+
+
+def api_request(
+    access_key: str,
+    secret_key: str,
+    method: str,
+    path: str,
+    payload: Optional[dict] = None,
+    timeout: int = 30,
+) -> Tuple[Any, int, str]:
+    url = API_HOST.rstrip("/") + path
+    body = b""
+    headers = {"Content-Type": "application/json"}
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+    token = qbox_token(access_key, secret_key, url, method=method, body=body)
+    headers["Authorization"] = "QBox " + token
+    resp = requests.request(method.upper(), url, data=body if payload is not None else None, headers=headers, timeout=timeout)
+    text = resp.text or ""
+    try:
+        data = resp.json() if text else {}
+    except Exception:
+        data = {"raw": text}
+    return data, resp.status_code, text
+
+
+def require_keys(params: dict) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    ak = (params.get("access_key") or params.get("access_key_id") or "").strip()
+    sk = (params.get("secret_key") or params.get("access_key_secret") or "").strip()
+    if not ak or not sk:
+        return None, None, "缺少 access_key / secret_key"
+    return ak, sk, None
+
+
+def get_metadata(_: dict) -> Dict[str, Any]:
+    return ok(
+        "插件信息",
+        {
+            "name": PLUGIN_NAME,
+            "description": "七牛云",
+            "version": PLUGIN_VERSION,
+            "author": "宝塔中国二次开发",
+            "config": [
+                {"name": "access_key", "description": "七牛 AccessKey", "type": "string", "required": True},
+                {"name": "secret_key", "description": "七牛 SecretKey", "type": "string", "required": True},
+                {"name": "force_https", "description": "默认强制 HTTPS（true/false）", "type": "string", "required": False},
+                {"name": "http2_enable", "description": "默认启用 HTTP2（true/false）", "type": "string", "required": False},
+            ],
+            "actions": [
+                {
+                    "name": "deploy_cdn_https",
+                    "description": "部署到七牛 CDN 域名 HTTPS",
+                    "params": [
+                        {"name": "domain", "description": "CDN 域名", "type": "string", "required": True},
+                        {"name": "force_https", "description": "强制 HTTPS", "type": "string", "required": False},
+                        {"name": "http2_enable", "description": "启用 HTTP2", "type": "string", "required": False},
+                        {"name": "cleanup", "description": "绑定成功后删除旧证书(需 old_cert_id)", "type": "string", "required": False},
+                        {"name": "old_cert_id", "description": "待删除的旧证书 ID", "type": "string", "required": False},
+                    ],
+                },
+                {
+                    "name": "deploy_oss_domain_https",
+                    "description": "部署到七牛对象存储自定义域名 HTTPS",
+                    "params": [
+                        {"name": "domain", "description": "存储自定义域名（如 pic.yianso.cn）", "type": "string", "required": True},
+                        {"name": "bucket", "description": "存储空间名（可选，用于校验）", "type": "string", "required": False},
+                        {"name": "force_https", "description": "强制 HTTPS", "type": "string", "required": False},
+                        {"name": "http2_enable", "description": "启用 HTTP2", "type": "string", "required": False},
+                        {"name": "cleanup", "description": "绑定成功后删除旧证书(需 old_cert_id)", "type": "string", "required": False},
+                        {"name": "old_cert_id", "description": "待删除的旧证书 ID", "type": "string", "required": False},
+                    ],
+                },
+                {
+                    "name": "list_certs",
+                    "description": "列出七牛证书库",
+                    "params": [
+                        {"name": "marker", "description": "分页 marker", "type": "string", "required": False},
+                        {"name": "limit", "description": "每页数量，默认 100", "type": "string", "required": False},
+                    ],
+                },
+                {
+                    "name": "delete_cert",
+                    "description": "删除七牛证书（须未绑定域名）",
+                    "params": [
+                        {"name": "cert_id", "description": "证书 ID", "type": "string", "required": True},
+                    ],
+                },
+                {
+                    "name": "replace_and_cleanup",
+                    "description": "部署并清理旧证书（目标级开关，默认应关闭）",
+                    "params": [
+                        {"name": "domain", "description": "域名", "type": "string", "required": True},
+                        {"name": "product", "description": "cdn 或 oss，默认 oss", "type": "string", "required": False},
+                        {"name": "old_cert_id", "description": "旧证书 ID", "type": "string", "required": False},
+                        {"name": "force_https", "description": "强制 HTTPS", "type": "string", "required": False},
+                        {"name": "http2_enable", "description": "启用 HTTP2", "type": "string", "required": False},
+                    ],
+                },
+            ],
+        },
+    )
+
+
+def upload_cert(ak: str, sk: str, domain: str, pri: str, ca: str) -> Tuple[Optional[str], Optional[str], Any]:
+    name = "{}-panel-{}".format(domain, datetime.datetime.now().strftime("%Y%m%d%H%M%S"))
+    data, code, raw = api_request(
+        ak,
+        sk,
+        "POST",
+        "/sslcert",
+        {"name": name, "common_name": domain.lstrip("*."), "pri": pri, "ca": ca},
+    )
+    if code >= 400 or not isinstance(data, dict) or not data.get("certID"):
+        return None, "上传证书失败(HTTP {}): {}".format(code, data.get("error") or raw or data), data
+    return data["certID"], None, data
+
+
+def bind_https(ak: str, sk: str, domain: str, cert_id: str, force_https: bool, http2_enable: bool) -> Tuple[bool, str, Any]:
+    payload = {"certId": cert_id, "forceHttps": force_https, "http2Enable": http2_enable}
+    data, code, raw = api_request(ak, sk, "PUT", "/domain/{}/httpsconf".format(domain), payload)
+    # 空响应且 2xx 视为成功
+    if 200 <= code < 300:
+        if isinstance(data, dict) and data.get("error"):
+            return False, "绑定 HTTPS 失败: {}".format(data.get("error")), data
+        return True, "绑定成功", data if data else {}
+    return False, "绑定 HTTPS 失败(HTTP {}): {}".format(code, (data.get("error") if isinstance(data, dict) else None) or raw or data), data
+
+
+def maybe_cleanup(ak: str, sk: str, params: dict, new_cert_id: str) -> Dict[str, Any]:
+    if not _bool(params.get("cleanup"), False):
+        return {"cleanup": False}
+    old_id = (params.get("old_cert_id") or "").strip()
+    if not old_id or old_id == new_cert_id:
+        return {"cleanup": False, "reason": "未提供有效 old_cert_id"}
+    data, code, raw = api_request(ak, sk, "DELETE", "/sslcert/{}".format(old_id), None)
+    if 200 <= code < 300 and not (isinstance(data, dict) and data.get("error")):
+        return {"cleanup": True, "deleted": old_id}
+    return {"cleanup": False, "deleted": old_id, "error": (data.get("error") if isinstance(data, dict) else None) or raw or "delete failed", "http": code}
+
+
+def deploy_domain(params: dict, product: str) -> Dict[str, Any]:
+    ak, sk, e = require_keys(params)
+    if e:
+        return err(e)
+    domain = (params.get("domain") or "").strip()
+    if not domain:
+        return err("缺少 domain")
+    cert = params.get("cert") or ""
+    key = params.get("key") or ""
+    if not cert or not key:
+        return err("缺少证书内容 cert/key")
+
+    force_https = _bool(params.get("force_https"), False)
+    http2_enable = _bool(params.get("http2_enable"), True)
+
+    cert_id, up_err, up_raw = upload_cert(ak, sk, domain, key, cert)
+    if up_err:
+        return err(up_err, {"upload": up_raw, "product": product})
+
+    ok_bind, msg, bind_raw = bind_https(ak, sk, domain, cert_id, force_https, http2_enable)
+    result = {
+        "product": product,
+        "domain": domain,
+        "cert_id": cert_id,
+        "force_https": force_https,
+        "http2_enable": http2_enable,
+        "bind": bind_raw,
+    }
+    if params.get("bucket"):
+        result["bucket"] = params.get("bucket")
+
+    if not ok_bind:
+        # 源站域名可能无法走 CDN httpsconf：证书已上传，返回 cert_id 便于控制台绑定
+        hint = ""
+        if product == "oss":
+            hint = "；若该域名为对象存储「源站域名」，七牛可能仅支持控制台绑证，请用返回的 cert_id 在控制台配置 HTTPS"
+        return err(msg + hint, result)
+
+    result.update(maybe_cleanup(ak, sk, params, cert_id))
+    return ok("部署到七牛{}域名成功: {}".format("CDN" if product == "cdn" else "存储", domain), result)
+
+
+def list_certs(params: dict) -> Dict[str, Any]:
+    ak, sk, e = require_keys(params)
+    if e:
+        return err(e)
+    marker = (params.get("marker") or "").strip()
+    try:
+        limit = int(params.get("limit") or 100)
+    except Exception:
+        limit = 100
+    qs = "?limit={}".format(limit)
+    if marker:
+        qs += "&marker={}".format(marker)
+    data, code, raw = api_request(ak, sk, "GET", "/sslcert" + qs, None)
+    if code >= 400:
+        return err("获取证书列表失败(HTTP {}): {}".format(code, (data.get("error") if isinstance(data, dict) else None) or raw), {"raw": data})
+    return ok("ok", data if isinstance(data, dict) else {"raw": data})
+
+
+def delete_cert(params: dict) -> Dict[str, Any]:
+    ak, sk, e = require_keys(params)
+    if e:
+        return err(e)
+    cert_id = (params.get("cert_id") or params.get("certId") or "").strip()
+    if not cert_id:
+        return err("缺少 cert_id")
+    data, code, raw = api_request(ak, sk, "DELETE", "/sslcert/{}".format(cert_id), None)
+    if code >= 400 or (isinstance(data, dict) and data.get("error")):
+        return err("删除失败(HTTP {}): {}".format(code, (data.get("error") if isinstance(data, dict) else None) or raw), {"raw": data})
+    return ok("已删除证书 {}".format(cert_id), {"cert_id": cert_id, "raw": data})
+
+
+def replace_and_cleanup(params: dict) -> Dict[str, Any]:
+    product = (params.get("product") or "oss").strip().lower()
+    if product not in ("cdn", "oss"):
+        product = "oss"
+    # 强制开启 cleanup
+    params = dict(params)
+    params["cleanup"] = True
+    return deploy_domain(params, product)
+
+
+ACTIONS = {
+    "get_metadata": get_metadata,
+    "deploy_cdn_https": lambda p: deploy_domain(p, "cdn"),
+    "deploy_oss_domain_https": lambda p: deploy_domain(p, "oss"),
+    "list_certs": list_certs,
+    "delete_cert": delete_cert,
+    "replace_and_cleanup": replace_and_cleanup,
+}
+
+
+def main() -> int:
+    try:
+        raw = sys.stdin.read()
+        req = json.loads(raw) if raw.strip() else {}
+    except Exception as e:
+        sys.stdout.write(json.dumps(err("无效请求: {}".format(e)), ensure_ascii=False))
+        return 0
+    action = (req.get("action") or "").strip()
+    params = req.get("params") or {}
+    if not isinstance(params, dict):
+        params = {}
+    handler = ACTIONS.get(action)
+    if not handler:
+        sys.stdout.write(json.dumps(err("不支持的 action: {}".format(action)), ensure_ascii=False))
+        return 0
+    try:
+        resp = handler(params)
+    except Exception as e:
+        resp = err("执行异常: {}".format(e))
+    sys.stdout.write(json.dumps(resp, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

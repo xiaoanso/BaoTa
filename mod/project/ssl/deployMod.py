@@ -39,6 +39,25 @@ class main:
     `create_time` TEXT,
     `update_time` TEXT
 );""",())
+        self._ensure_target_columns()
+
+    def _ensure_target_columns(self):
+        """二次开发：证书绑定与自动部署字段"""
+        try:
+            import sqlite3
+            db_file = public.get_panel_path() + '/data/db/ssl_data.db'
+            conn = sqlite3.connect(db_file)
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(deploy_targets)")
+            names = {row[1] for row in cur.fetchall()}
+            if "ssl_hash" not in names:
+                cur.execute("ALTER TABLE deploy_targets ADD COLUMN ssl_hash TEXT DEFAULT ''")
+            if "auto_deploy" not in names:
+                cur.execute("ALTER TABLE deploy_targets ADD COLUMN auto_deploy INTEGER DEFAULT 0")
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            public.print_log("deploy_targets 字段迁移失败: {}".format(e))
 
     def M(self, table_name):
         import db
@@ -302,6 +321,8 @@ class main:
             'action': get.method,
             'params': get.params,
             'type': get.type,
+            'ssl_hash': getattr(get, 'ssl_hash', '') or '',
+            'auto_deploy': 1 if str(getattr(get, 'auto_deploy', 0) or 0) in ('1', 'true', 'True') else 0,
             'create_time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
             'update_time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
         }
@@ -367,6 +388,10 @@ class main:
             'type': get.type,
             'update_time': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
         }
+        if hasattr(get, 'ssl_hash'):
+            data['ssl_hash'] = get.ssl_hash or ''
+        if hasattr(get, 'auto_deploy'):
+            data['auto_deploy'] = 1 if str(get.auto_deploy) in ('1', 'true', 'True') else 0
         self.M('deploy_targets').where('id=?', (get.target_id,)).update(data)
         return {'status': True, 'msg': '修改成功'}
 
@@ -460,3 +485,138 @@ class main:
         params["key"] = key
 
         return plugin.call_plugin(auth["type"], target["action"], params)
+
+    @staticmethod
+    def _domain_matched(cert_domains, target_domain: str) -> bool:
+        if not target_domain or not cert_domains:
+            return False
+        td = target_domain.strip().lower().lstrip("*.")
+        for d in cert_domains:
+            if not d:
+                continue
+            dd = str(d).strip().lower()
+            if dd == target_domain.strip().lower():
+                return True
+            if dd.startswith("*.") and (td == dd[2:] or td.endswith("." + dd[2:])):
+                return True
+            if td == dd.lstrip("*."):
+                return True
+        return False
+
+    def _notify_deploy(self, title: str, lines: list, success: bool = True):
+        """到期提醒通道：复用面板告警（邮件/钉钉等已配置的通道）"""
+        try:
+            slist = [">结果：{}".format("成功" if success else "失败")] + [">" + str(x) for x in lines]
+            msg = public.get_push_info(title, slist)
+            # 尝试各通道；未配置则仅写日志
+            for module in ("mail", "dingding", "weixin", "feishu", "wx_account"):
+                try:
+                    public.push_msg(module, msg)
+                except Exception:
+                    pass
+            public.WriteLog("SSL授权部署", "{} | {}".format(title, "；".join(str(x) for x in lines)))
+        except Exception as e:
+            public.WriteLog("SSL授权部署", "通知发送失败: {} | {}".format(e, title))
+
+    def execute_target_by_id(self, target_id, ssl_hash=None, oid=None, cert=None, key=None, max_retry=3, retry_interval=10):
+        """执行单个部署目标，失败有限重试"""
+        get = public.dict_obj()
+        get.target_id = target_id
+        if ssl_hash:
+            get.ssl_hash = ssl_hash
+        if oid:
+            get.oid = oid
+        if cert and key:
+            get.cert = cert
+            get.key = key
+        last = None
+        for i in range(max(1, int(max_retry))):
+            last = self.execute_action(get)
+            ok = False
+            if isinstance(last, dict):
+                # 插件协议 success / 面板 False
+                if last.get("status") in ("success", True, 1, "1"):
+                    ok = True
+                if last.get("status") is True or last.get("status") == "success":
+                    ok = True
+                # call_plugin 返回 status=success|error
+                if last.get("status") == "error":
+                    ok = False
+                if last.get("status") is False:
+                    ok = False
+            if ok:
+                return True, last
+            if i + 1 < max_retry:
+                time.sleep(retry_interval)
+        return False, last
+
+    def auto_deploy_on_cert_change(self, new_ssl_hash, domains=None, old_ssl_hash=None, oid=None, notify_success=True):
+        """
+        证书申请/续签成功后：按 ssl_hash 或域名匹配 auto_deploy 目标并推送。
+        续签后 hash 会变，需把旧 hash 目标迁到新 hash。
+        """
+        self._ensure_target_columns()
+        domains = domains or []
+        if isinstance(domains, str):
+            domains = [d.strip() for d in domains.split(",") if d.strip()]
+
+        if old_ssl_hash and new_ssl_hash and old_ssl_hash != new_ssl_hash:
+            try:
+                self.M("deploy_targets").where("ssl_hash=?", (old_ssl_hash,)).update(
+                    {"ssl_hash": new_ssl_hash, "update_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}
+                )
+            except Exception:
+                pass
+
+        try:
+            rows = self.M("deploy_targets").where("auto_deploy=?", (1,)).select()
+        except Exception:
+            rows = []
+        if not rows:
+            return {"status": True, "msg": "无自动部署目标", "deployed": []}
+
+        results = []
+        for t in rows:
+            try:
+                params = json.loads(t.get("params") or "{}")
+            except Exception:
+                params = {}
+            target_domain = (params.get("domain") or "").strip()
+            bound = (t.get("ssl_hash") or "") == (new_ssl_hash or "")
+            by_domain = self._domain_matched(domains, target_domain) if target_domain else False
+            if not bound and not by_domain:
+                continue
+            if by_domain and new_ssl_hash and (t.get("ssl_hash") or "") != new_ssl_hash:
+                try:
+                    self.M("deploy_targets").where("id=?", (t["id"],)).update(
+                        {"ssl_hash": new_ssl_hash, "update_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}
+                    )
+                except Exception:
+                    pass
+
+            ok, resp = self.execute_target_by_id(
+                t["id"], ssl_hash=new_ssl_hash, oid=oid, max_retry=3, retry_interval=10
+            )
+            msg = ""
+            if isinstance(resp, dict):
+                msg = resp.get("message") or resp.get("msg") or ""
+            item = {"target_id": t["id"], "name": t.get("name"), "domain": target_domain, "ok": ok, "msg": msg}
+            results.append(item)
+            if ok and notify_success:
+                self._notify_deploy(
+                    "SSL授权部署成功",
+                    ["目标：{}".format(t.get("name")), "域名：{}".format(target_domain), "ssl_hash：{}".format(new_ssl_hash)],
+                    True,
+                )
+            if not ok:
+                self._notify_deploy(
+                    "SSL授权部署失败（证书已续签）",
+                    [
+                        "目标：{}".format(t.get("name")),
+                        "域名：{}".format(target_domain),
+                        "ssl_hash：{}".format(new_ssl_hash),
+                        "原因：{}".format(msg or resp),
+                    ],
+                    False,
+                )
+        return {"status": True, "msg": "完成", "deployed": results}

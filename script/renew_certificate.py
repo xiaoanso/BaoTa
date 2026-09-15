@@ -83,17 +83,40 @@ class RenewCertificate:
             return False
 
     def redeploy_cert(self,cert):
-        if len(cert['use_site']) == 0:
-            return
-        last_site = cert['use_site'][-1]
-        for site in cert['use_site']:
-            print("**正在重新部署证书到站点 {}...".format(site))
-            get = public.dict_obj()
-            get.oid = cert['oid']
-            get.siteName = site
-            get.reload = 1 if site == last_site else 0
-            self.panelssl.set_cert(get)
-        print("**证书{} 重新部署完成...".format(cert['domainName']))
+        if len(cert.get('use_site') or []) > 0:
+            last_site = cert['use_site'][-1]
+            for site in cert['use_site']:
+                print("**正在重新部署证书到站点 {}...".format(site))
+                get = public.dict_obj()
+                get.oid = cert['oid']
+                get.siteName = site
+                get.reload = 1 if site == last_site else 0
+                self.panelssl.set_cert(get)
+            print("**证书{} 重新部署完成...".format(cert['domainName']))
+        # 授权部署：商业证续签后推送到云厂商目标（如七牛）
+        try:
+            domains = []
+            if cert.get('domainName'):
+                domains = [x.strip() for x in str(cert['domainName']).replace(';', ',').split(',') if x.strip()]
+            ssl_hash = None
+            try:
+                get = public.dict_obj()
+                get.oid = cert['oid']
+                rep = self.panelssl.get_order_find(get)
+                full = (rep.get('certificate') or '') + "\n" + (rep.get('caCertificate') or '')
+                from hashlib import md5
+                ssl_hash = md5(full.encode('utf-8')).hexdigest()
+            except Exception as e:
+                print("**计算商业证书 hash 失败: {}".format(e))
+            from mod.project.ssl.deployMod import main as deploy_main
+            res = deploy_main().auto_deploy_on_cert_change(
+                new_ssl_hash=ssl_hash or '',
+                domains=domains,
+                oid=cert.get('oid'),
+            )
+            print("**授权部署自动推送结果: {}".format(res))
+        except Exception as e:
+            print("**授权部署自动推送失败: {}".format(e))
 
     def renew_certificate(self):
         """
