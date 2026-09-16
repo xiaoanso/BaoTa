@@ -1,0 +1,45 @@
+name: verify-ssl-ext
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Isolation + hook markers
+        run: python3 mod/project/ssl/ssl_ext/verify.py
+
+      - name: Qiniu plugin metadata
+        run: |
+          python3 -m pip install -q requests
+          printf '%s\n' '{"action":"get_metadata","params":{}}' | python3 mod/project/ssl/deploy_plugins/qiniu/qiniu | python3 -c '
+          import json,sys
+          p=json.load(sys.stdin)
+          assert p.get("status")=="success", p
+          names=[a["name"] for a in p["result"]["actions"]]
+          need=["deploy_cdn_https","deploy_oss_domain_https","list_certs","delete_cert","replace_and_cleanup"]
+          missing=[n for n in need if n not in names]
+          assert not missing, missing
+          print("qiniu actions ok", names)
+          '
+
+      - name: Isolated files present
+        run: |
+          test -f mod/project/ssl/ssl_ext/hooks.py
+          test -f script/ssl_le_toolkit.py
+          test -f mod/project/ssl/deploy_plugins/qiniu/qiniu
+          test -f mod/project/ssl/deploy_plugins/qiniu/RUNBOOK.md

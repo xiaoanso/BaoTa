@@ -219,14 +219,13 @@ def qiniu_ensure_target(domain: str, action: str = "deploy_cdn_https", ssl_hash:
 
 
 def qiniu_deploy(domain: str, ssl_hash: str = "") -> None:
-    from mod.project.ssl.deployMod import main as deploy_main
+    from mod.project.ssl.ssl_ext import deploy as ext_deploy
 
-    m = deploy_main()
     ssl_hash = ssl_hash or find_ssl_hash(domain)
     if not ssl_hash:
         raise RuntimeError("未找到域名 {} 的本地证书 hash".format(domain))
     tid = qiniu_ensure_target(domain, ssl_hash=ssl_hash, auto_deploy=True)
-    ok, resp = m.execute_target_by_id(tid, ssl_hash=ssl_hash, max_retry=3, retry_interval=5)
+    ok, resp = ext_deploy.execute_target_by_id(tid, ssl_hash=ssl_hash, max_retry=3, retry_interval=5)
     print("[..] 七牛部署 ok={} resp={}".format(ok, resp))
     if not ok:
         raise RuntimeError("七牛部署失败")

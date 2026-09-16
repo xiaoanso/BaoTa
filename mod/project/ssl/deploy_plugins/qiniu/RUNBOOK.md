@@ -24,7 +24,34 @@
 
 ---
 
-## 2. 架构结论（二次开发）
+## 2. 隔离与官方升级（防双向覆盖）
+
+自有仓锁版本；官方更新由你决定是否 merge。官方三文件**只允许**带标记的钩子，业务在 `mod/project/ssl/ssl_ext/`，通过 `from acme_v2 import acme_v2` / `from deployMod import main` 再调用。
+
+```
+# >>> BT_EXT:<id>
+from mod.project.ssl.ssl_ext import hooks
+hooks.after_save_cert(...)
+# <<< BT_EXT:<id>
+```
+
+| 官方文件 | 允许的标记 |
+|----------|------------|
+| `class/acme_v2.py` | `ssl_csr` `ssl_deploy` `ssl_renew_hashes` |
+| `mod/project/ssl/deployMod.py` | `ssl_schema` `ssl_target_fields` |
+| `script/renew_certificate.py` | `ssl_commercial` |
+
+`install_to_host.sh` **禁止**覆盖上述官方文件。合并官方后跑：
+
+```bash
+python3 mod/project/ssl/ssl_ext/verify.py
+```
+
+CI：`.github/workflows/verify.yml`（push / PR 自动跑同一套检查）。
+
+---
+
+## 2.1 架构结论（二次开发）
 
 ```
 面板证书申请/续签 (acme_v2, DNS-01)
@@ -126,10 +153,12 @@ btpython /www/server/panel/script/ssl_le_toolkit.py qiniu-deploy --domain pic.ex
 |------|------|
 | `mod/project/ssl/deploy_plugins/qiniu/qiniu` | 七牛 deploy_plugin |
 | `mod/project/ssl/deploy_plugins/qiniu/install_to_host.sh` | 同步插件+面板补丁到主机 |
-| `mod/project/ssl/deployMod.py` | 授权部署 + auto_deploy 钩子 |
-| `class/acme_v2.py` | LE 申请/续签 + CSR 回退 + 续签后推送 |
-| `script/renew_certificate.py` | 商业证续签后推送（DigiCert/商业路径） |
+| `mod/project/ssl/ssl_ext/` | 隔离业务（hooks / deploy / verify） |
+| `mod/project/ssl/deployMod.py` | 官方授权部署 + `BT_EXT` 钩子 |
+| `class/acme_v2.py` | 官方 LE + `BT_EXT` 钩子 |
+| `script/renew_certificate.py` | 官方商业续签 + `BT_EXT` 钩子 |
 | `script/ssl_le_toolkit.py` | **日常复用入口** |
+| `.github/workflows/verify.yml` | 合并后自动校验隔离 |
 
 ---
 
