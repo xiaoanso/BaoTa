@@ -33,6 +33,9 @@ htmlcov/
 *.log
 *.pid
 *.sock
+/pyenv/
+/logs/
+/default.pl
 
 # IDE and OS files
 .idea/

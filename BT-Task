@@ -1,4 +1,4 @@
-#!/www/server/panel/pyenv/bin/python
+#!/www/server/panel/pyenv/bin/python3
 #coding: utf-8
 # +-------------------------------------------------------------------
 # | 宝塔Linux面板

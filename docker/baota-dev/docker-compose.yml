@@ -1,0 +1,70 @@
+# 本机 macOS 验证 Linux 宝塔二次开发。
+# 面板源码 = 本仓库；官方镜像只提供 Linux 运行时（pyenv / 系统包 / /bt.sh）。
+services:
+  seed:
+    image: btpanel/baota:slim
+    container_name: baota-dev-seed
+    restart: "no"
+    entrypoint: ["/bin/bash", "/opt/baota-dev/seed-runtime.sh"]
+    volumes:
+      - ./seed-runtime.sh:/opt/baota-dev/seed-runtime.sh:ro
+      - panel_pyenv:/out/pyenv
+      - panel_data:/out/data
+
+  panel:
+    image: btpanel/baota:slim
+    # 若必须贴近 x86 ECS，取消下一行（会走 qemu，明显变慢）
+    # platform: linux/amd64
+    container_name: baota-dev
+    privileged: true
+    restart: unless-stopped
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    ports:
+      - "8888:8888"
+      - "80:80"
+      - "443:443"
+    volumes:
+      - www_data:/www
+      - ../..:/www/server/panel
+      - panel_pyenv:/www/server/panel/pyenv
+      - panel_data:/www/server/panel/data
+      - panel_logs:/www/server/panel/logs
+      - /www/server/panel/.git
+      - /www/server/panel/.venv
+      - /www/server/panel/.github
+      - /www/server/panel/docker
+      - ../../mod/project/ssl/deploy_plugins/qiniu/qiniu:/www/server/deploy_plugin/qiniu
+      - ./entrypoint.sh:/opt/baota-dev/entrypoint.sh:ro
+      - ./install-qiniu-plugin.sh:/opt/baota-dev/install-qiniu-plugin.sh:ro
+    entrypoint: ["/bin/bash", "/opt/baota-dev/entrypoint.sh"]
+    environment:
+      TZ: Asia/Shanghai
+
+  # 空 Debian 内执行官方安装脚本（下载的是官网包，不是本仓库；一般不必）
+  bootstrap:
+    profiles: ["bootstrap"]
+    image: debian:12
+    platform: linux/amd64
+    privileged: true
+    hostname: baota-bootstrap
+    working_dir: /root
+    command:
+      - bash
+      - -lc
+      - |
+        set -e
+        apt-get update
+        apt-get install -y --no-install-recommends curl wget ca-certificates procps
+        curl -sSO https://download.bt.cn/install/install_panel.sh
+        bash install_panel.sh -y btg26
+    volumes:
+      - bootstrap_www:/www
+
+volumes:
+  www_data:
+  panel_pyenv:
+  panel_data:
+  panel_logs:
+  bootstrap_www:
